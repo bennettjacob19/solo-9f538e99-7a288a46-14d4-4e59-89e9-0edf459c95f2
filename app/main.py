@@ -11,7 +11,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import threading
 import uuid
 from contextlib import asynccontextmanager
 
@@ -21,12 +23,14 @@ from fastapi import FastAPI, HTTPException
 from . import ml
 from .schemas import PlanRequest
 from .scheduler import EvaluationSpec, solve
-from .simulator import Session
+from .simulator import CheckpointWriteFailed, Session
 
 DATA_DIR = os.environ.get("APP_DATA_DIR", os.path.join(os.getcwd(), "sessions_data"))
 os.makedirs(DATA_DIR, exist_ok=True)
 
 SESSIONS: dict[str, Session] = {}
+# 仅保护 SESSIONS 字典本身的注册/枚举，临界区绝不包含训练或写盘。
+REGISTRY_LOCK = threading.Lock()
 
 
 @asynccontextmanager
@@ -83,7 +87,8 @@ def create_plan(req: PlanRequest) -> dict:
         data_dir=DATA_DIR,
         num_batches=len(req.durations),
     )
-    SESSIONS[session_id] = session
+    with REGISTRY_LOCK:
+        SESSIONS[session_id] = session
     return {
         "accepted": True,
         "session_id": session_id,
@@ -95,34 +100,51 @@ def create_plan(req: PlanRequest) -> dict:
 
 
 @app.get("/sessions")
-def list_sessions() -> dict:
-    return {
-        "sessions": [
-            {"session_id": sid, **{k: v for k, v in s.status().items()
-                                   if k != "session_id"}}
-            for sid, s in sorted(SESSIONS.items())
-        ]
-    }
+async def list_sessions() -> dict:
+    # 直接读各会话已发布的不可变快照，不碰会话锁，写盘卡住也立即返回。
+    with REGISTRY_LOCK:
+        items = sorted(SESSIONS.items())
+    sessions = []
+    for sid, session in items:
+        snap = session.status_snapshot()
+        item = {k: v for k, v in snap.items() if k != "session_id"}
+        sessions.append({"session_id": sid, **item})
+    return {"sessions": sessions}
 
 
 @app.get("/sessions/{session_id}")
-def get_session(session_id: str) -> dict:
+async def get_session(session_id: str) -> dict:
     session = _require_session(session_id)
-    return session.status()
+    return session.status_snapshot()
 
 
 @app.post("/sessions/{session_id}/advance")
-def advance_clock(session_id: str, seconds: int) -> dict:
+async def advance_clock(session_id: str, seconds: int) -> dict:
     session = _require_session(session_id)
     if seconds <= 0:
         raise HTTPException(status_code=400, detail="seconds 必须为正整数")
-    return session.advance(seconds)
+
+    # 投递到该会话专属的单线程执行器：同会话的推进严格逐个执行，
+    # 后一个一定在前一个实际停下后才起算；等待中的请求只 await future，
+    # 不占用 anyio/uvicorn 的公共工作线程，因此不会饿死查询和其他会话。
+    future = session.submit_advance(seconds)
+    try:
+        return await asyncio.wrap_future(future)
+    except CheckpointWriteFailed as exc:
+        detail = exc.error_info()
+        # 与正常 /advance 同构的本次已完成部分（clock/advanced_events）。
+        if exc.partial_response:
+            detail.update(exc.partial_response)
+        # 再附完整状态快照，方便调用方核对后原样重试。
+        detail["progress"] = session.status_snapshot()
+        raise HTTPException(status_code=500, detail=detail) from exc
 
 
 @app.get("/sessions/{session_id}/results")
-def get_results(session_id: str) -> dict:
+async def get_results(session_id: str) -> dict:
     session = _require_session(session_id)
-    out = session.results()
+    # 复制一份再补 session_id，避免改写已发布的共享快照。
+    out = dict(session.results_snapshot())
     out["session_id"] = session_id
     return out
 

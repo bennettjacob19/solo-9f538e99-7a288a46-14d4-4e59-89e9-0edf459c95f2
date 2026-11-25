@@ -31,10 +31,26 @@ app/
   simulator.py   模拟时钟、训练/存档/评测的实际副作用与回滚
   schemas.py     Pydantic 入参校验（24 批 / 4 场评测等上限）
   main.py        FastAPI 路由
-tests/           pytest 测试（21 个）
+tests/           pytest 测试（31 个，含并发推进/写盘故障隔离）
 demo/run_demo.py 纯标准库端到端演示脚本
 Dockerfile, docker-compose.yml
 ```
+
+## 并发与存档失败语义（/advance）
+
+* **同会话串行**：每个会话有专属单线程执行器与会话锁。对同一会话连发
+  `/advance` 会逐个推进，后一个请求在前者实际停下的 `clock` 上起算，
+  每个排程时段恰好完成一次——不会重复写检查点，也不会因游标竞争漏掉评测。
+  等待中的请求只 `await` 一个 future，**不占用** FastAPI/anyio 公共工作线程，
+  因此即使排队推进数超过工作线程数，`GET /sessions{,/id,/results}` 仍直接
+  读不可变进度快照、毫秒返回，其他会话在各自执行器上照常推进。
+* **写盘失败可续跑**：检查点按排程原定编号 `checkpoint_NNN.npz` 原子写入
+  （临时文件 + `fsync` + `os.replace`）。写失败时 `/advance` 返回 500
+  （`detail.error = checkpoint_write_failed`，附本次已完成时段与完整进度），
+  此前已跑完的时段全部保留，失败的检查点时段不提交；之后推进再次覆盖该时段
+  时按**原编号补写**，评测仍读原定文件，权重不被破坏，最终一致性不变。
+* **进度快照**：每完成一个时段发布一份新的只读状态/结果快照，查询不与写盘
+  争用同一把锁，故某个会话写盘卡住时查询与其他会话不受影响。
 
 ## 启动方式
 
@@ -62,7 +78,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/plans` | 提交排程；有解 201 创建会话，无解 422 不启动 |
 | GET | `/sessions` | 列出全部会话及当前时钟 |
 | GET | `/sessions/{id}` | 查询已执行的训练/存档/评测时段、重跑批数 |
-| POST | `/sessions/{id}/advance?seconds=N` | 推进模拟时钟 N 秒（时段不可拆，跑不完不产生效果） |
+| POST | `/sessions/{id}/advance?seconds=N` | 同会话串行推进 N 秒（时段不可拆）；写盘失败返回 500 且可按原检查点编号重试 |
 | GET | `/sessions/{id}/results` | 最终权重、参考权重、最大绝对差、一致性结论 |
 | GET | `/health` | 健康检查 |
 
@@ -87,8 +103,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 python demo/run_demo.py           # 需先启动服务
-python -m pytest tests/ -q        # 21 个测试
+python -m pytest tests/ -q        # 31 个测试
 ```
+
+并发/故障专项见 `tests/test_concurrency.py`：真实 uvicorn + 48 个并发推进
+（超过 anyio 默认 40 工作线程）下查询秒回、其他会话照常，以及写失败后按
+原编号补写接续。
 
 ## 求解器说明
 

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass
 
 import numpy as np
@@ -112,18 +113,60 @@ class Checkpoint:
         }
 
 
+def checkpoint_path(directory: str, checkpoint_id: int) -> str:
+    """检查点的原定文件路径；编号在首次排程时确定，重试补写也不变。"""
+    return os.path.join(directory, f"checkpoint_{checkpoint_id:03d}.npz")
+
+
 def save_checkpoint(
     directory: str, checkpoint_id: int, batches_trained: int, weights: np.ndarray
 ) -> Checkpoint:
+    """原子写入检查点：先写同目录临时文件，fsync 后 ``os.replace`` 改名。
+
+    这样写盘中途失败/卡住时，原定路径上不会留下半截 .npz；事后用同一
+    ``checkpoint_id`` 重试会写到同一个最终路径（按原编号补写）。
+    """
     os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, f"checkpoint_{checkpoint_id:03d}.npz")
-    np.savez(
-        path,
-        weights=weights,
-        batches_trained=np.int64(batches_trained),
-        checkpoint_id=np.int64(checkpoint_id),
+    path = checkpoint_path(directory, checkpoint_id)
+    # 后缀必须以 .npz 结尾，避免 np.savez 再自动追加 .npz。
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".checkpoint_{checkpoint_id:03d}.", suffix=".tmp.npz", dir=directory
     )
+    os.close(fd)
+    try:
+        np.savez(
+            tmp_path,
+            weights=weights,
+            batches_trained=np.int64(batches_trained),
+            checkpoint_id=np.int64(checkpoint_id),
+        )
+        with open(tmp_path, "rb+") as fh:
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+        _fsync_directory(directory)
+    except BaseException:
+        # 失败时清理临时文件；原定 path 要么是旧完整文件，要么不存在，
+        # 绝不会是写了一半的文件。
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     return Checkpoint(checkpoint_id, batches_trained, weights.copy(), path)
+
+
+def _fsync_directory(directory: str) -> None:
+    """best-effort 持久化 rename；某些文件系统不支持，忽略即可。"""
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 def load_checkpoint(path: str) -> tuple[np.ndarray, int]:
